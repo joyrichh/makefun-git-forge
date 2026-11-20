@@ -37,7 +37,7 @@ export function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
-    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("end", () => resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)));
     req.on("error", reject);
   });
 }
@@ -110,6 +110,8 @@ function v2Advertisement(): Buffer {
   return Buffer.concat([...lines.map((l) => pktLine(l)), pktFlush()]);
 }
 
+const V2_ADVERTISEMENT = v2Advertisement();
+
 function v0Advertisement(repo: Repo, service: string): Buffer {
   const caps = [
     `symref=HEAD:refs/heads/${repo.defaultBranch}`,
@@ -157,7 +159,7 @@ export async function handleInfoRefs(
   const proto = (req.headers["git-protocol"] ?? "").toString();
   const wantV2 = service === "git-upload-pack" && proto.includes("version=2");
   if (service === "git-upload-pack") {
-    const body = wantV2 ? v2Advertisement() : v0Advertisement(repo, service);
+    const body = wantV2 ? V2_ADVERTISEMENT : v0Advertisement(repo, service);
     send(res, 200, "application/x-git-upload-pack-advertisement", body);
   } else {
     const body = v0Advertisement(repo, service);
@@ -192,7 +194,12 @@ function parseLsRefsArgs(items: ReturnType<typeof parsePktLines>["items"]): LsRe
   return args;
 }
 
+const lsRefsResponses = new WeakMap<Repo, { version: number; key: string; body: Buffer }>();
+
 function lsRefsResponse(repo: Repo, args: LsRefsArgs): Buffer {
+  const key = JSON.stringify([repo.defaultBranch, args]);
+  const cached = lsRefsResponses.get(repo);
+  if (cached?.version === repo.gitVersion && cached.key === key) return cached.body;
   const parts: Buffer[] = [];
   const keep = (name: string): boolean =>
     args.prefixes.length === 0 || args.prefixes.some((p) => name.startsWith(p));
@@ -217,7 +224,9 @@ function lsRefsResponse(repo: Repo, args: LsRefsArgs): Buffer {
   }
   for (const l of lines) parts.push(pktLine(l));
   parts.push(pktFlush());
-  return Buffer.concat(parts);
+  const body = Buffer.concat(parts);
+  lsRefsResponses.set(repo, { version: repo.gitVersion, key, body });
+  return body;
 }
 
 interface FetchArgs {
@@ -264,7 +273,12 @@ function sidebandPackets(pack: Buffer): Buffer[] {
   return out;
 }
 
+const fetchResponses = new WeakMap<Repo, { version: number; key: string; body: Buffer }>();
+
 function fetchResponse(repo: Repo, args: FetchArgs): Buffer {
+  const key = JSON.stringify(args);
+  const cached = fetchResponses.get(repo);
+  if (cached?.version === repo.gitVersion && cached.key === key) return cached.body;
   const parts: Buffer[] = [];
   const haves = new Set(args.haves);
   const lookup = (oid: string): GitObject | undefined => repo.objects.get(oid);
@@ -320,10 +334,12 @@ function fetchResponse(repo: Repo, args: FetchArgs): Buffer {
 
   // packfile
   parts.push(pktLine("packfile\n"));
-  const pack = writePack([...objects.values()]);
+  const pack = writePack(objects);
   parts.push(...sidebandPackets(pack));
   parts.push(pktFlush());
-  return Buffer.concat(parts);
+  const body = Buffer.concat(parts);
+  fetchResponses.set(repo, { version: repo.gitVersion, key, body });
+  return body;
 }
 
 export async function handleUploadPack(

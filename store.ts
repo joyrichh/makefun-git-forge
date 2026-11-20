@@ -73,6 +73,7 @@ export interface Repo {
   createdSeq: number;
   objects: Map<string, GitObject>;
   refs: Map<string, string>; // refName -> oid
+  gitVersion: number;
   issues: Map<number, Issue>;
   nextIssueNumber: number;
   pulls: Map<number, Pull>;
@@ -111,6 +112,7 @@ export class Store {
       createdSeq: this.nextSeq(),
       objects: new Map(),
       refs: new Map(),
+      gitVersion: 0,
       issues: new Map(),
       nextIssueNumber: 1,
       pulls: new Map(),
@@ -142,11 +144,15 @@ export class Store {
 
   putObject(repo: Repo, type: GitObject["type"], data: Buffer): string {
     const oid = hashObject(type, data);
-    if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+    if (!repo.objects.has(oid)) {
+      repo.objects.set(oid, { type, data });
+      repo.gitVersion++;
+    }
     return oid;
   }
 
   putObjects(repo: Repo, objects: Map<string, GitObject>): void {
+    repo.gitVersion++;
     for (const [oid, obj] of objects) {
       if (!repo.objects.has(oid)) repo.objects.set(oid, obj);
     }
@@ -160,9 +166,11 @@ export class Store {
 
   setRef(repo: Repo, refName: string, oid: string): void {
     repo.refs.set(refName, oid);
+    repo.gitVersion++;
   }
 
   deleteRef(repo: Repo, refName: string): boolean {
+    repo.gitVersion++;
     return repo.refs.delete(refName);
   }
 

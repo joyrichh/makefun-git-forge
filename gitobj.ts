@@ -43,7 +43,7 @@ export function objectRaw(type: ObjectType, data: Buffer): Buffer {
 
 /** Hash an object (type + data) to its git oid. */
 export function hashObject(type: ObjectType, data: Buffer): string {
-  return sha1Hex(objectRaw(type, data));
+  return createHash("sha1").update(`${type} ${data.length}\0`, "ascii").update(data).digest("hex");
 }
 
 export function oidToBuffer(oid: string): Buffer {
@@ -161,10 +161,13 @@ export function parseTag(data: Buffer): Tag {
 // ---------------------------------------------------------------- pkt-lines
 
 export function pktLine(payload: Buffer | string): Buffer {
-  const data = typeof payload === "string" ? Buffer.from(payload, "utf8") : payload;
-  const len = data.length + 4;
-  const prefix = Buffer.from(len.toString(16).padStart(4, "0"), "ascii");
-  return Buffer.concat([prefix, data]);
+  const size = typeof payload === "string" ? Buffer.byteLength(payload, "utf8") : payload.length;
+  const prefix = (size + 4).toString(16).padStart(4, "0");
+  if (typeof payload === "string") return Buffer.from(prefix + payload, "utf8");
+  const packet = Buffer.allocUnsafe(prefix.length + size);
+  packet.write(prefix, 0, prefix.length, "ascii");
+  payload.copy(packet, prefix.length);
+  return packet;
 }
 
 export const pktFlush = (): Buffer => Buffer.from("0000", "ascii");
@@ -225,9 +228,9 @@ function encodeObjectHeader(typeCode: number, size: number): Buffer {
 }
 
 /** Inflate one zlib stream at `offset`; returns its bytes and the offset just past it. */
-export function inflateAt(buf: Buffer, offset: number): { data: Buffer; next: number } {
+export function inflateAt(buf: Buffer, offset: number, size = 16384): { data: Buffer; next: number } {
   const view = buf.subarray(offset);
-  const result = inflateSync(view, { info: true }) as unknown as {
+  const result = inflateSync(view, { info: true, chunkSize: Math.max(64, Math.min(size, 16384)) }) as unknown as {
     buffer: Buffer;
     engine: { bytesWritten: number };
   };
@@ -310,7 +313,8 @@ export function readPack(
   const count = buf.readUInt32BE(8);
   const trailerStart = buf.length - 20;
   const trailer = buf.subarray(trailerStart).toString("hex");
-  const computed = sha1Hex(buf.subarray(0, trailerStart));
+  const packBody = buf.subarray(0, trailerStart);
+  const computed = sha1Hex(packBody);
   if (trailer !== computed) throw new Error("pack trailer checksum mismatch");
 
   interface RawEntry {
@@ -326,7 +330,6 @@ export function readPack(
   }
 
   const raw: RawEntry[] = [];
-  const byOffset = new Map<number, RawEntry>();
   let offset = 12;
 
   const readObjectHeader = (): { typeCode: number; size: number } => {
@@ -361,20 +364,27 @@ export function readPack(
     } else if (!CODE_TYPE[typeCode]) {
       throw new Error(`pack entry ${n} has unknown type code ${typeCode}`);
     }
-    const inflated = inflateAt(buf.subarray(0, trailerStart), offset);
+    const inflated = inflateAt(packBody, offset, size);
     if (inflated.data.length !== size) {
       throw new Error(`pack entry at ${entryOffset} declares ${size} bytes but inflated to ${inflated.data.length}`);
     }
     entry.data = inflated.data;
     offset = inflated.next;
     raw.push(entry);
-    byOffset.set(entryOffset, entry);
   }
   if (offset !== trailerStart) {
     throw new Error(`pack has ${trailerStart - offset} stray bytes before its trailer`);
   }
 
   const objects = new Map<string, GitObject>();
+  if (raw.every((entry) => entry.typeCode !== 6 && entry.typeCode !== 7)) {
+    for (const entry of raw) {
+      const type = CODE_TYPE[entry.typeCode];
+      objects.set(hashObject(type, entry.data), { type, data: entry.data });
+    }
+    return objects;
+  }
+  const byOffset = new Map(raw.map((entry) => [entry.offset, entry]));
   const resolvedByOid = new Map<string, RawEntry>();
   const resolving = new Set<number>();
 
@@ -419,21 +429,29 @@ export function readPack(
 }
 
 /** Write a packfile (v2, plain objects, no deltas). Deterministic order. */
-export function writePack(objects: GitObject[]): Buffer {
-  const sorted = [...objects].sort((a, b) => {
-    const oa = hashObject(a.type, a.data);
-    const ob = hashObject(b.type, b.data);
-    return oa < ob ? -1 : oa > ob ? 1 : 0;
-  });
+const packedObjects = new WeakMap<GitObject, Buffer>();
+
+export function writePack(objects: GitObject[] | Map<string, GitObject>): Buffer {
+  const entries: [string, GitObject][] = objects instanceof Map
+    ? [...objects]
+    : objects.map((obj) => [hashObject(obj.type, obj.data), obj]);
+  const sorted = entries.sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
   const parts: Buffer[] = [];
   const header = Buffer.alloc(12);
   header.write("PACK", 0, "ascii");
   header.writeUInt32BE(2, 4);
   header.writeUInt32BE(sorted.length, 8);
   parts.push(header);
-  for (const obj of sorted) {
-    parts.push(encodeObjectHeader(TYPE_CODE[obj.type], obj.data.length));
-    parts.push(deflateSync(obj.data, { level: 1 }));
+  for (const [, obj] of sorted) {
+    let packed = packedObjects.get(obj);
+    if (!packed) {
+      packed = Buffer.concat([
+        encodeObjectHeader(TYPE_CODE[obj.type], obj.data.length),
+        deflateSync(obj.data, { level: 1 }),
+      ]);
+      packedObjects.set(obj, packed);
+    }
+    parts.push(packed);
   }
   const body = Buffer.concat(parts);
   const trailer = createHash("sha1").update(body).digest();

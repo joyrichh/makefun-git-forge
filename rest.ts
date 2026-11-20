@@ -5,7 +5,7 @@
 // module is called.
 
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { store, type Repo, type Issue, type Pull } from "./store.ts";
+import { store, type Repo, type Issue, type Pull, type Label } from "./store.ts";
 import { parseCommit } from "./gitobj.ts";
 import { VIEWER } from "./scenario.ts";
 
@@ -13,7 +13,7 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
-    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("end", () => resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)));
     req.on("error", reject);
   });
 }
@@ -27,10 +27,10 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
 }
 
 function sendJson(res: ServerResponse, status: number, value: unknown, extraHeaders: Record<string, string> = {}): void {
-  const body = Buffer.from(JSON.stringify(value), "utf8");
+  const body = JSON.stringify(value);
   res.writeHead(status, {
     "Content-Type": "application/json",
-    "Content-Length": body.length,
+    "Content-Length": Buffer.byteLength(body, "utf8"),
     ...extraHeaders,
   });
   res.end(body);
@@ -107,6 +107,51 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     comments: issue.comments.length,
     html_url: "",
   };
+}
+
+interface IssueResponse {
+  id: number;
+  number: number;
+  title: string;
+  body: string;
+  state: string;
+  createdSeq: number;
+  updatedSeq: number;
+  comments: number;
+  labels: string[];
+  labelValues: (Label | undefined)[];
+  response: string;
+  responseLength: number;
+}
+
+const issueResponses = new WeakMap<Issue, IssueResponse>();
+
+function issueResponse(repo: Repo, issue: Issue): IssueResponse {
+  const cached = issueResponses.get(issue);
+  if (cached && cached.id === issue.id && cached.number === issue.number &&
+      cached.title === issue.title && cached.body === issue.body && cached.state === issue.state &&
+      cached.createdSeq === issue.createdSeq && cached.updatedSeq === issue.updatedSeq &&
+      cached.comments === issue.comments.length && cached.labels.length === issue.labels.length &&
+      cached.labels.every((name, index) => name === issue.labels[index] && cached.labelValues[index] === repo.labels.get(name))) {
+    return cached;
+  }
+  const response = JSON.stringify(issueJson(repo, issue));
+  const entry: IssueResponse = {
+    id: issue.id,
+    number: issue.number,
+    title: issue.title,
+    body: issue.body,
+    state: issue.state,
+    createdSeq: issue.createdSeq,
+    updatedSeq: issue.updatedSeq,
+    comments: issue.comments.length,
+    labels: [...issue.labels],
+    labelValues: issue.labels.map((name) => repo.labels.get(name)),
+    response,
+    responseLength: Buffer.byteLength(response, "utf8"),
+  };
+  issueResponses.set(issue, entry);
+  return entry;
 }
 
 function pullJson(repo: Repo, pull: Pull): Record<string, unknown> {
@@ -224,9 +269,21 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse): Pro
   }
 }
 
+let lastRestRoute: { target: string; base: string; url: URL; segments: string[] } | undefined;
+
 async function dispatchRest(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
-  const url = new URL(req.url ?? "/", baseUrl(req));
-  const segments = url.pathname.split("/").filter((s) => s.length > 0).map(decodeSegment);
+  const target = req.url ?? "/";
+  const base = baseUrl(req);
+  if (!lastRestRoute || lastRestRoute.target !== target || lastRestRoute.base !== base) {
+    const url = new URL(target, base);
+    lastRestRoute = {
+      target,
+      base,
+      url,
+      segments: url.pathname.split("/").filter((s) => s.length > 0).map(decodeSegment),
+    };
+  }
+  const { url, segments } = lastRestRoute;
   const method = req.method ?? "GET";
   const query = url.searchParams;
 
@@ -681,7 +738,9 @@ async function getIssue(res: ServerResponse, owner: string, name: string, num: n
   if (!repo) return true;
   const issue = repo.issues.get(num);
   if (!issue) return sendError(res, 404, "Not Found"), true;
-  sendJson(res, 200, issueJson(repo, issue));
+  const body = issueResponse(repo, issue);
+  res.writeHead(200, { "Content-Type": "application/json", "Content-Length": body.responseLength });
+  res.end(body.response);
   return true;
 }
 

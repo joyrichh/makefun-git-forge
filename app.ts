@@ -49,9 +49,17 @@ export function createApp() {
   return server;
 }
 
+let lastTarget: string | undefined;
+let lastUrl: URL;
+
 async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? "GET";
-  const url = new URL(req.url ?? "/", "http://127.0.0.1");
+  const target = req.url ?? "/";
+  if (target !== lastTarget) {
+    lastUrl = new URL(target, "http://127.0.0.1");
+    lastTarget = target;
+  }
+  const url = lastUrl;
   const path = url.pathname;
 
   if (method === "GET" && path === "/healthz") {
